@@ -147,10 +147,10 @@ jobs:
           \t\t# configure's tests cannot silently fall back to Apple curses.
           \t\tfor i in "${!cfenv[@]}"; do
           \t\t\tif [[ "${cfenv[$i]}" == CPPFLAGS=* ]]; then
-          \t\t\t\tcfenv[$i]="CPPFLAGS=-I$ncurses_include ${cfenv[$i]#CPPFLAGS=}"
+          \t\t\t\tcfenv[$i]="CPPFLAGS=-I$ncurses_include -DNCURSES_WIDECHAR=1 ${cfenv[$i]#CPPFLAGS=}"
           \t\t\tfi
           \t\tdone
-          \t\tcfenv+=(NCURSES_CFLAGS="-I$ncurses_include" NCURSES_LIBS="$ncurses_archive")
+          \t\tcfenv+=(NCURSES_CFLAGS="-I$ncurses_include -DNCURSES_WIDECHAR=1" NCURSES_LIBS="$ncurses_archive")
           \t\tcfopts+=(--with-ncurses-include-dir="$ncurses_include"
           \t\t         --enable-pinentry-curses --enable-pinentry-tty)
           \tfi
@@ -182,6 +182,8 @@ jobs:
           \t\t\tdie 'Pinentry did not detect wide-character ncurses'
           \t\tgrep -Fq -- "-I$GPGOSX_NCURSES_PREFIX/include" pinentry/Makefile ||
           \t\t\tdie 'Pinentry Makefile does not use Homebrew ncursesw headers'
+          \t\tgrep -Fq -- '-DNCURSES_WIDECHAR=1' pinentry/Makefile ||
+          \t\t\tdie 'Pinentry Makefile did not enable wide curses'
           \t\tgrep -Fq "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" pinentry/Makefile ||
           \t\t\tdie 'Pinentry Makefile does not link static ncursesw'
           \tfi
@@ -344,11 +346,14 @@ jobs:
           cat > "$RUNNER_TEMP/ncursesw-smoke.c" <<'C'
           #include <wchar.h>
           #include <curses.h>
+          #if !defined(NCURSES_WIDECHAR) || NCURSES_WIDECHAR != 1
+          #error "ncurses wide-character API disabled"
+          #endif
           int main(void) { return addnwstr(L"x", 1); }
           C
           "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
             "-mmacosx-version-min=$min_ver" -Werror=implicit-function-declaration \
-            -I"$GPGOSX_NCURSES_PREFIX/include" \
+            -DNCURSES_WIDECHAR=1 -I"$GPGOSX_NCURSES_PREFIX/include" \
             "$RUNNER_TEMP/ncursesw-smoke.c" \
             "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" \
             -o "$RUNNER_TEMP/ncursesw-smoke"
