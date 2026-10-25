@@ -1,0 +1,376 @@
+name: Build GnuPG macOS DMGs
+
+on:
+  workflow_dispatch:
+    inputs:
+      gnupg_version:
+        description: 'Official GnuPG version, for example 2.5.24'
+        required: true
+        type: string
+        default: '2.5.24'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gnupg-dmg-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    env:
+      GNUPG_VERSION: ${{ inputs.gnupg_version }}
+      GPGOSX_WORKDIR: ${{ runner.temp }}/gnupg-work
+      GPGOSX_DOWNLOADDIR: ${{ runner.temp }}/gnupg-download
+      SOURCE_DIR: ${{ runner.temp }}/gpgosx-source
+      ARCH: ${{ matrix.arch }}
+
+    steps:
+      - name: Validate requested GnuPG version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GNUPG_VERSION" =~ ^2\.(4|5)\.[0-9]+$ ]]; then
+            echo 'Only official GnuPG 2.4.x / 2.5.x release versions are supported.' >&2
+            exit 1
+          fi
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install pkgconf gnupg autoconf automake libtool gettext lzip
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+          xcodebuild -version
+          clang --version
+
+      - name: Retrieve macOS build machinery
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://git.code.sf.net/p/gpgosx/source "$SOURCE_DIR"
+          # The audited upstream build system is archived. Do not silently
+          # switch to an unreviewed future commit.
+          actual="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+          if [[ "$actual" != eb61c5* ]]; then
+            echo "Unexpected GnuPG for OS X revision: $actual" >&2
+            exit 1
+          fi
+          test -f "$SOURCE_DIR/build.sh"
+          test -f "$SOURCE_DIR/common.sh"
+          test -f "$SOURCE_DIR/scripts/convert-keyring"
+          mkdir -p "$GPGOSX_WORKDIR" "$GPGOSX_DOWNLOADDIR" "$SOURCE_DIR/logs"
+
+      - name: Update dependencies and disable upstream's unconfigured signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          # Versions from the provided archive were too old for GnuPG 2.5.24.
+          # Keep the original dependency order: libgpg-error before libgcrypt.
+          cat > libraries <<'LIBRARIES'
+          https://ftp.gnu.org/gnu/libiconv/libiconv-1.17.tar.gz|sig
+          https://ftp.gnu.org/gnu/gettext/gettext-0.23.tar.lz|sig
+          https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.61.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/libassuan/libassuan-3.0.2.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/libksba/libksba-1.8.1.tar.bz2|sig
+          https://ftp.gnu.org/gnu/readline/readline-8.2.tar.gz|sig
+          https://gnupg.org/ftp/gcrypt/npth/npth-1.8.tar.bz2|sig
+          https://sqlite.org/2024/sqlite-autoconf-3470200.tar.gz|40f0296080bb63f0321a5652477a6ab87c757aa2
+          https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.12.4.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/ntbtls/ntbtls-0.3.2.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/gpgme/gpgme-1.24.1.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/pinentry/pinentry-1.3.3.tar.bz2|sig
+          LIBRARIES
+          # The workflow verifies the GnuPG release tarball explicitly below.
+          # Legacy library signature verification cannot work on a fresh runner
+          # without the different upstream library maintainers' public keys.
+          sed -i '' 's/^GPGOSX_EXISTING_BINARY=gpg$/GPGOSX_EXISTING_BINARY=/' common.sh
+          sed -i '' 's/^DMG_SIGNING_KEY=.*/DMG_SIGNING_KEY=/' common.sh
+          grep -qx 'GPGOSX_EXISTING_BINARY=' common.sh
+          grep -qx 'DMG_SIGNING_KEY=' common.sh
+
+      - name: Download and authenticate official GnuPG release
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_url="https://gnupg.org/ftp/gcrypt/gnupg/gnupg-${GNUPG_VERSION}.tar.bz2"
+          source_file="$GPGOSX_DOWNLOADDIR/gnupg-${GNUPG_VERSION}.tar.bz2"
+          curl --fail --location --retry 4 --silent --show-error -o "$source_file" "$source_url"
+          curl --fail --location --retry 4 --silent --show-error -o "$source_file.sig" "$source_url.sig"
+          curl --fail --location --retry 4 --silent --show-error -o "$RUNNER_TEMP/gnupg-signing-keys.asc" \
+            https://gnupg.org/signature_key.asc
+          export GNUPGHOME="$RUNNER_TEMP/gnupg-verify-home"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --import "$RUNNER_TEMP/gnupg-signing-keys.asc"
+          # Pin the release-signing identities documented by GnuPG.
+          allowed='^(6DAA6E64A76D2840571B4902528897B826403ADA|AC8E115BF73E2D8D47FA9908E98E9B2D19C6C8BD|3B761AE4E63BF3519CE7D63BECB664CBE1332EEF|D02AE49173BDAD56E4F88223707E56D3DEF4115C|02F38DFF731FF97CB039A1DA549E695E905BA208|1493269DE61F124AA69A316E3ADF34EBDBB200A4)$'
+          gpg --batch --status-fd 1 --verify "$source_file.sig" "$source_file" \
+            > "$RUNNER_TEMP/signature-status.log" 2>&1 || {
+              cat "$RUNNER_TEMP/signature-status.log"; exit 1;
+            }
+          cat "$RUNNER_TEMP/signature-status.log"
+          awk '/^\[GNUPG:\] VALIDSIG / { print $3 }' "$RUNNER_TEMP/signature-status.log" \
+            | grep -Eq "$allowed" || {
+              echo 'The signature is not from an allowed GnuPG release key.' >&2
+              exit 1
+            }
+          tar -tf "$source_file" | head -n 5 || true
+
+      - name: Compile GnuPG and all runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="/usr/local/gnupg-${GNUPG_VERSION%.*}"
+          sudo mkdir -p "$install_dir"
+          sudo chown "$(id -un)" "$install_dir"
+          cd "$SOURCE_DIR"
+          # Avoid Makefile's original `| tee` masking the actual build failure.
+          bash ./build.sh "$ARCH" "$SOURCE_DIR/config-rel.sh" 2>&1 \
+            | tee "$SOURCE_DIR/logs/build-${ARCH}.log"
+          output="$GPGOSX_WORKDIR/${ARCH}-rel"
+          test -x "$output/bin/gpg"
+          file "$output/bin/gpg"
+          "$output/bin/gpg" --version
+
+      - name: Archive architecture-specific build
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C "$GPGOSX_WORKDIR" -czf \
+            "$RUNNER_TEMP/gnupg-${ARCH}.tar.gz" "${ARCH}-rel"
+
+      - name: Upload architecture-specific build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gnupg-${{ matrix.arch }}-${{ inputs.gnupg_version }}
+          path: ${{ runner.temp }}/gnupg-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
+
+  package:
+    name: Package ARM64, x86_64 and Universal DMGs
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GNUPG_VERSION: ${{ inputs.gnupg_version }}
+
+    steps:
+      - name: Download architecture-specific builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gnupg-*-${{ inputs.gnupg_version }}
+          path: ${{ runner.temp }}/archives
+          merge-multiple: true
+
+      - name: Merge binaries into a Universal 2 installer and DMG
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/gnupg-package"
+          mkdir -p "$work" "$work/rel" "$work/dmg-content" "$work/output" "$work/pkg-scripts"
+          tar -C "$work" -xzf "$RUNNER_TEMP/archives/gnupg-arm64.tar.gz"
+          tar -C "$work" -xzf "$RUNNER_TEMP/archives/gnupg-x86_64.tar.gz"
+
+          arm="$work/arm64-rel"
+          intel="$work/x86_64-rel"
+          rel="$work/rel"
+          prefix="/usr/local/gnupg-${GNUPG_VERSION%.*}"
+          test -x "$arm/bin/gpg"
+          test -x "$intel/bin/gpg"
+          rsync -a "$arm/" "$rel/"
+
+          count=0
+          while IFS= read -r -d '' source; do
+            relative="${source#"$arm"/}"
+            dest="$rel/$relative"
+            if file -b "$source" | grep -q 'Mach-O'; then
+              counterpart="$intel/$relative"
+              test -f "$counterpart" || {
+                echo "Missing Intel counterpart: $relative" >&2; exit 1;
+              }
+              lipo -create "$counterpart" "$source" -output "$dest"
+              architectures=" $(lipo -archs "$dest") "
+              [[ "$architectures" == *' x86_64 '* && "$architectures" == *' arm64 '* ]] || {
+                echo "Not universal: $relative ($architectures)" >&2; exit 1;
+              }
+              codesign --force --sign - "$dest"
+              count=$((count + 1))
+              if otool -L "$dest" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/gnupg-package/|/gnupg-work/'; then
+                echo "Non-portable library reference in $relative" >&2
+                exit 1
+              fi
+            elif [[ "$(head -c 2 "$source")" == '#!' ]]; then
+              # Correct occasional ARM stage-directory paths in text scripts.
+              if grep -Fq "$arm" "$dest"; then
+                sed -i '' "s|$arm|$prefix|g" "$dest"
+              fi
+            fi
+          done < <(find "$arm/bin" "$arm/lib" "$arm/libexec" -type f -print0)
+          (( count > 0 )) || { echo 'No Mach-O files were merged.' >&2; exit 1; }
+          echo "Merged $count Mach-O files"
+          lipo -info "$rel/bin/gpg"
+          codesign --verify "$rel/bin/gpg"
+
+          # Unlike the original postinstall, never remove another GPG
+          # installation or uninstall GPGTools on the user's machine.
+          cat > "$work/pkg-scripts/postinstall" <<'POSTINSTALL'
+          #!/bin/sh
+          set -eu
+          GPGOSX_INSTALLDIR=/usr/local/gnupg-2.5
+          mkdir -p /usr/local/bin
+          for name in gpg gpg2 gpgconf gpgsm gpg-agent gpg-connect-agent dirmngr pinentry; do
+            target="$GPGOSX_INSTALLDIR/bin/$name"
+            link="/usr/local/bin/$name"
+            if [ -x "$target" ] && [ ! -e "$link" ] && [ ! -L "$link" ]; then
+              ln -s "$target" "$link"
+            fi
+          done
+          exit 0
+          POSTINSTALL
+          sed -i '' "s|^GPGOSX_INSTALLDIR=.*|GPGOSX_INSTALLDIR=$prefix|" \
+            "$work/pkg-scripts/postinstall"
+          chmod 0755 "$work/pkg-scripts/postinstall"
+
+          pkgbuild \
+            --root "$rel" \
+            --install-location "$prefix" \
+            --identifier 'org.community.gnupg.universal' \
+            --version "$GNUPG_VERSION" \
+            --scripts "$work/pkg-scripts" \
+            "$work/GnuPG.pkg"
+          productbuild --package "$work/GnuPG.pkg" "$work/dmg-content/Install.pkg"
+
+          cat > "$work/dmg-content/README.txt" <<EOF
+          GnuPG $GNUPG_VERSION for macOS (Universal 2: arm64 + x86_64)
+
+          Open Install.pkg to install the command-line GnuPG tools.
+          Installed files: $prefix
+          Where possible, new command-line symlinks are created in /usr/local/bin.
+          Existing tools and GPGTools installations are left untouched.
+
+          This package is not Developer ID signed or notarized.
+          EOF
+
+          image="GnuPG-${GNUPG_VERSION}-universal.dmg"
+          hdiutil create \
+            -ov -format UDZO -fs HFS+ \
+            -volname "GnuPG $GNUPG_VERSION" \
+            -srcfolder "$work/dmg-content" \
+            "$work/output/$image"
+          hdiutil verify "$work/output/$image"
+          (cd "$work/output" && shasum -a 256 "$image" > "$image.sha256")
+          ls -lh "$work/output"
+
+      - name: Build separate ARM64 and x86_64 installer DMGs
+        shell: bash
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/gnupg-package"
+          prefix="/usr/local/gnupg-${GNUPG_VERSION%.*}"
+          test -x "$work/arm64-rel/bin/gpg"
+          test -x "$work/x86_64-rel/bin/gpg"
+          test -x "$work/pkg-scripts/postinstall"
+
+          for arch in arm64 x86_64; do
+            stage="$work/${arch}-rel"
+            dmg_folder="$work/dmg-${arch}"
+            mkdir -p "$dmg_folder"
+
+            # A standalone DMG must contain only the requested architecture.
+            machos=0
+            while IFS= read -r -d '' binary; do
+              if file -b "$binary" | grep -q 'Mach-O'; then
+                found=" $(lipo -archs "$binary") "
+                if [[ "$found" != " $arch " ]]; then
+                  echo "Wrong architecture in ${binary#"$stage"/}: $found (expected $arch)" >&2
+                  exit 1
+                fi
+                if otool -L "$binary" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/gnupg-package/|/gnupg-work/'; then
+                  echo "Non-portable library reference: $binary" >&2
+                  exit 1
+                fi
+                machos=$((machos + 1))
+              fi
+            done < <(find "$stage" -type f -print0)
+            (( machos > 0 )) || {
+              echo "No Mach-O files found for $arch" >&2
+              exit 1
+            }
+            echo "Verified $machos $arch Mach-O files"
+
+            pkgbuild \
+              --root "$stage" \
+              --install-location "$prefix" \
+              --identifier "org.community.gnupg.${arch}" \
+              --version "$GNUPG_VERSION" \
+              --scripts "$work/pkg-scripts" \
+              "$work/GnuPG-${arch}.pkg"
+            productbuild --package "$work/GnuPG-${arch}.pkg" "$dmg_folder/Install.pkg"
+
+            cat > "$dmg_folder/README.txt" <<EOF
+          GnuPG $GNUPG_VERSION for macOS ($arch)
+
+          This installer contains only $arch binaries; it is not Universal.
+          Open Install.pkg to install the command-line GnuPG tools.
+          Installed files: $prefix
+          Where possible, new command-line symlinks are created in /usr/local/bin.
+          Existing tools and GPGTools installations are left untouched.
+
+          This package is not Developer ID signed or notarized.
+          EOF
+
+            image="GnuPG-${GNUPG_VERSION}-${arch}.dmg"
+            hdiutil create \
+              -ov -format UDZO -fs HFS+ \
+              -volname "GnuPG $GNUPG_VERSION $arch" \
+              -srcfolder "$dmg_folder" \
+              "$work/output/$image"
+            hdiutil verify "$work/output/$image"
+            (cd "$work/output" && shasum -a 256 "$image" > "$image.sha256")
+          done
+
+          ls -lh "$work/output"
+
+      - name: Upload ARM64 DMG and SHA-256
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnuPG-${{ inputs.gnupg_version }}-ARM64-DMG
+          path: |
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-arm64.dmg
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-arm64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload x86_64 DMG and SHA-256
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnuPG-${{ inputs.gnupg_version }}-x86_64-DMG
+          path: |
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-x86_64.dmg
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-x86_64.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Universal DMG and SHA-256
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnuPG-${{ inputs.gnupg_version }}-Universal-DMG
+          path: |
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-universal.dmg
+            ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-universal.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
