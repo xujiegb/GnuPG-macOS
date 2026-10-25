@@ -453,8 +453,16 @@ jobs:
               }
               codesign --force --sign - "$dest"
               count=$((count + 1))
-              if otool -L "$dest" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/gnupg-package/|/gnupg-work/'; then
-                echo "Non-portable library reference in $relative" >&2
+              bad_refs="$(otool -L "$dest" | awk '
+              /^[[:space:]]+/ {
+                dependency = $1
+                if (dependency ~ /^\/opt\/homebrew\// ||
+                    dependency ~ /^\/usr\/local\/(Cellar|opt)\// ||
+                    dependency ~ /\/gnupg-(package|work)\//)
+                  print dependency
+              }')"
+              if [[ -n "$bad_refs" ]]; then
+                printf 'Non-portable library reference in %s:\n%s\n' "$relative" "$bad_refs" >&2
                 exit 1
               fi
             elif [[ "$(head -c 2 "$source")" == '#!' ]]; then
@@ -543,8 +551,16 @@ jobs:
                   echo "Wrong architecture in ${binary#"$stage"/}: $found (expected $arch)" >&2
                   exit 1
                 fi
-                if otool -L "$binary" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/gnupg-package/|/gnupg-work/'; then
-                  echo "Non-portable library reference: $binary" >&2
+                bad_refs="$(otool -L "$binary" | awk '
+                /^[[:space:]]+/ {
+                  dependency = $1
+                  if (dependency ~ /^\/opt\/homebrew\// ||
+                      dependency ~ /^\/usr\/local\/(Cellar|opt)\// ||
+                      dependency ~ /\/gnupg-(package|work)\//)
+                    print dependency
+                }')"
+                if [[ -n "$bad_refs" ]]; then
+                  printf 'Non-portable library reference in %s:\n%s\n' "$binary" "$bad_refs" >&2
                   exit 1
                 fi
                 machos=$((machos + 1))
