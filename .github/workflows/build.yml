@@ -83,20 +83,22 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SOURCE_DIR"
-          # Versions from the provided archive were too old for GnuPG 2.5.24.
-          # Keep the original dependency order: libgpg-error before libgcrypt.
+          # Latest upstream stable library releases checked on 2026-10-25.
+          # Preserve build order required by the original GnuPG for OS X script.
+          # SQLite needs a SHA-1 value for this legacy script; it is also
+          # independently checked against SQLite's published SHA3-256 below.
           cat > libraries <<'LIBRARIES'
-          https://ftp.gnu.org/gnu/libiconv/libiconv-1.17.tar.gz|sig
-          https://ftp.gnu.org/gnu/gettext/gettext-0.23.tar.lz|sig
+          https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz|sig
+          https://ftp.gnu.org/gnu/gettext/gettext-1.0.tar.lz|sig
           https://gnupg.org/ftp/gcrypt/libgpg-error/libgpg-error-1.61.tar.bz2|sig
           https://gnupg.org/ftp/gcrypt/libassuan/libassuan-3.0.2.tar.bz2|sig
           https://gnupg.org/ftp/gcrypt/libksba/libksba-1.8.1.tar.bz2|sig
-          https://ftp.gnu.org/gnu/readline/readline-8.2.tar.gz|sig
+          https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz|sig
           https://gnupg.org/ftp/gcrypt/npth/npth-1.8.tar.bz2|sig
-          https://sqlite.org/2024/sqlite-autoconf-3470200.tar.gz|40f0296080bb63f0321a5652477a6ab87c757aa2
+          https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz|87a0ad77300ee86a06d54cd3d2b5a7274214d6ba
           https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.12.4.tar.bz2|sig
           https://gnupg.org/ftp/gcrypt/ntbtls/ntbtls-0.3.2.tar.bz2|sig
-          https://gnupg.org/ftp/gcrypt/gpgme/gpgme-1.24.1.tar.bz2|sig
+          https://gnupg.org/ftp/gcrypt/gpgme/gpgme-2.2.0.tar.bz2|sig
           https://gnupg.org/ftp/gcrypt/pinentry/pinentry-1.3.3.tar.bz2|sig
           LIBRARIES
           # The workflow verifies the GnuPG release tarball explicitly below.
@@ -106,6 +108,29 @@ jobs:
           sed -i '' 's/^DMG_SIGNING_KEY=.*/DMG_SIGNING_KEY=/' common.sh
           grep -qx 'GPGOSX_EXISTING_BINARY=' common.sh
           grep -qx 'DMG_SIGNING_KEY=' common.sh
+
+      - name: Download and authenticate SQLite source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sqlite_file="$GPGOSX_DOWNLOADDIR/sqlite-autoconf-3540100.tar.gz"
+          curl --fail --location --retry 4 --silent --show-error \
+            --output "$sqlite_file" \
+            https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz
+          # This hash is published on sqlite.org/download.html for SQLite 3.54.1.
+          # Perform SHA3-256 validation in addition to the legacy SHA-1 check.
+          python3 - "$sqlite_file" <<'PYTHON'
+          import hashlib
+          import pathlib
+          import sys
+
+          expected = 'b6ced585c750916b1052667239a12c25a7ff34e7f06e1e6e01ecb0427657d9c4'
+          path = pathlib.Path(sys.argv[1])
+          actual = hashlib.sha3_256(path.read_bytes()).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'SQLite SHA3-256 mismatch: {actual}')
+          print(f'Verified SQLite SHA3-256: {actual}')
+          PYTHON
 
       - name: Download and authenticate official GnuPG release
         shell: bash
