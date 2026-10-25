@@ -55,11 +55,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install pkgconf gnupg autoconf automake libtool gettext lzip
+          brew install pkgconf gnupg autoconf automake libtool gettext lzip ncurses
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
           xcodebuild -version
           clang --version
+
+      - name: Check Homebrew wide-character ncurses toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ncurses_prefix="$(brew --prefix ncurses)"
+          test -f "$ncurses_prefix/include/ncursesw/curses.h" || {
+            echo 'Homebrew ncursesw headers are missing.' >&2; exit 1;
+          }
+          test -f "$ncurses_prefix/lib/libncursesw.a" || {
+            echo 'Homebrew static libncursesw.a is missing.' >&2; exit 1;
+          }
+          printf 'GPGOSX_NCURSES_PREFIX=%s\n' "$ncurses_prefix" >> "$GITHUB_ENV"
+          echo "Using static wide-character ncurses from $ncurses_prefix"
 
       - name: Retrieve macOS build machinery
         shell: bash
@@ -78,7 +92,7 @@ jobs:
           test -f "$SOURCE_DIR/scripts/convert-keyring"
           mkdir -p "$GPGOSX_WORKDIR" "$GPGOSX_DOWNLOADDIR" "$SOURCE_DIR/logs"
 
-      - name: Adapt legacy build for SQLite and verify libgcrypt TLS
+      - name: Adapt legacy build for SQLite, libgcrypt TLS, and Pinentry ncursesw
         shell: bash
         run: |
           set -euo pipefail
@@ -107,6 +121,26 @@ jobs:
               raise SystemExit('Unexpected upstream build.sh layout; refusing unsafe patch')
           original = original.replace(before, after, 1)
 
+          # Pinentry may detect Apple's ncursesw via pkg-config, while still
+          # compiling against the SDK's narrow /usr/include/curses.h.  Pass a
+          # matching Homebrew wide-character header AND static library, so the
+          # installed DMG does not depend on /opt/homebrew or a Homebrew Cellar.
+          pinentry_hook = '\tbuild_log "Configure $lib"\n'
+          pinentry_config = '''\tif [[ "$libname" == pinentry ]]; then
+          \t\t: "${GPGOSX_NCURSES_PREFIX:?Missing Homebrew ncurses prefix}"
+          \t\tncurses_include="$GPGOSX_NCURSES_PREFIX/include/ncursesw"
+          \t\tncurses_archive="$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a"
+          \t\t[[ -f "$ncurses_include/curses.h" && -f "$ncurses_archive" ]] ||
+          \t\t\tdie 'Missing matching wide-character ncurses headers/static archive'
+          \t\tcfenv+=(NCURSES_CFLAGS="-I$ncurses_include" NCURSES_LIBS="$ncurses_archive")
+          \t\tcfopts+=(--with-ncurses-include-dir="$ncurses_include"
+          \t\t         --enable-pinentry-curses --enable-pinentry-tty)
+          \tfi
+          '''
+          if original.count(pinentry_hook) != 1:
+              raise SystemExit('Could not safely locate pinentry configure hook')
+          original = original.replace(pinentry_hook, pinentry_config + pinentry_hook, 1)
+
           # Abort immediately if libgcrypt's configure falsely detects no TLS.
           # Otherwise the subsequent src/fips.c compilation fails with a
           # misleading 'requires thread-local storage' error.
@@ -122,8 +156,21 @@ jobs:
           '''
           if original.count(configure_line) != 1:
               raise SystemExit('Unexpected upstream libgcrypt configure command; refusing patch')
-          path.write_text(original.replace(configure_line, configure_line + check_tls, 1))
-          print('Patched SQLite configure and libgcrypt TLS configuration check')
+          # Refuse to build against mismatched curses headers and libraries.
+          # Pinentry's configure check must actually enable the wide API and
+          # its generated Makefile must use the static archive requested above.
+          check_pinentry = '''\tif [[ "$libname" == pinentry ]]; then
+          \t\tgrep -Eq '^#define HAVE_NCURSESW 1$' config.h ||
+          \t\t\tdie 'Pinentry did not detect wide-character ncurses'
+          \t\tgrep -Fq "$GPGOSX_NCURSES_PREFIX/include/ncursesw" pinentry/Makefile ||
+          \t\t\tdie 'Pinentry Makefile does not use Homebrew ncursesw headers'
+          \t\tgrep -Fq "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" pinentry/Makefile ||
+          \t\t\tdie 'Pinentry Makefile does not link static ncursesw'
+          \tfi
+          '''
+          path.write_text(original.replace(configure_line,
+              configure_line + check_tls + check_pinentry, 1))
+          print('Patched SQLite configure, libgcrypt TLS check, and Pinentry ncursesw')
           PYTHON
           # Apple Clang 16.4 emits -Wdeprecated-ofast. libgcrypt configure.ac
           # enables -Werror for feature probes (including __thread), so the
@@ -274,6 +321,24 @@ jobs:
             "$RUNNER_TEMP/tls-smoke.c" -o "$RUNNER_TEMP/tls-smoke"
           "$RUNNER_TEMP/tls-smoke"
           echo "Verified $ARCH compiler __thread TLS under -O3 -Werror"
+          # Real compile/link probe to ensure ncursesw headers and static archive
+          # belong together.  Never run this program: it needs a curses terminal.
+          cat > "$RUNNER_TEMP/ncursesw-smoke.c" <<'C'
+          #include <wchar.h>
+          #include <curses.h>
+          int main(void) { return addnwstr(L"x", 1); }
+          C
+          "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
+            "-mmacosx-version-min=$min_ver" -Werror=implicit-function-declaration \
+            -I"$GPGOSX_NCURSES_PREFIX/include/ncursesw" \
+            "$RUNNER_TEMP/ncursesw-smoke.c" \
+            "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" \
+            -o "$RUNNER_TEMP/ncursesw-smoke"
+          if otool -L "$RUNNER_TEMP/ncursesw-smoke" | grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/'; then
+            echo 'Homebrew dynamic runtime dependency leaked into ncursesw probe' >&2
+            exit 1
+          fi
+          echo "Verified static $ARCH ncursesw and addnwstr"
           install_dir="/usr/local/gnupg-${GNUPG_VERSION%.*}"
           sudo mkdir -p "$install_dir"
           sudo chown "$(id -un)" "$install_dir"
@@ -295,6 +360,9 @@ jobs:
             ${{ runner.temp }}/gpgosx-source/logs/
             ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/libgcrypt-1.12.4/config.log
             ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/libgcrypt-1.12.4/config.h
+            ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/pinentry-1.3.3/config.log
+            ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/pinentry-1.3.3/config.h
+            ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/pinentry-1.3.3/pinentry/Makefile
           if-no-files-found: ignore
           retention-days: 7
 
