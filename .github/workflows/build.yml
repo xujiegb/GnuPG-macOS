@@ -31,9 +31,6 @@ jobs:
     timeout-minutes: 360
     env:
       GNUPG_VERSION: ${{ inputs.gnupg_version }}
-      GPGOSX_WORKDIR: ${{ runner.temp }}/gnupg-work
-      GPGOSX_DOWNLOADDIR: ${{ runner.temp }}/gnupg-download
-      SOURCE_DIR: ${{ runner.temp }}/gpgosx-source
       ARCH: ${{ matrix.arch }}
 
     steps:
@@ -45,6 +42,14 @@ jobs:
             echo 'Only official GnuPG 2.4.x / 2.5.x release versions are supported.' >&2
             exit 1
           fi
+
+      - name: Prepare runner temporary directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'GPGOSX_WORKDIR=%s\n' "$RUNNER_TEMP/gnupg-work" >> "$GITHUB_ENV"
+          printf 'GPGOSX_DOWNLOADDIR=%s\n' "$RUNNER_TEMP/gnupg-download" >> "$GITHUB_ENV"
+          printf 'SOURCE_DIR=%s\n' "$RUNNER_TEMP/gpgosx-source" >> "$GITHUB_ENV"
 
       - name: Install build tools
         shell: bash
