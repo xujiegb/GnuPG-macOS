@@ -66,9 +66,14 @@ jobs:
         run: |
           set -euo pipefail
           ncurses_prefix="$(brew --prefix ncurses)"
-          test -f "$ncurses_prefix/include/ncursesw/curses.h" || {
-            echo 'Homebrew ncursesw headers are missing.' >&2; exit 1;
-          }
+          for header in \
+            "$ncurses_prefix/include/curses.h" \
+            "$ncurses_prefix/include/ncursesw/curses.h" \
+            "$ncurses_prefix/include/ncursesw/ncurses_dll.h"; do
+            test -f "$header" || {
+              echo "Homebrew ncursesw header is missing: $header" >&2; exit 1;
+            }
+          done
           test -f "$ncurses_prefix/lib/libncursesw.a" || {
             echo 'Homebrew static libncursesw.a is missing.' >&2; exit 1;
           }
@@ -123,15 +128,28 @@ jobs:
 
           # Pinentry may detect Apple's ncursesw via pkg-config, while still
           # compiling against the SDK's narrow /usr/include/curses.h.  Pass a
-          # matching Homebrew wide-character header AND static library, so the
+          # matching Homebrew wide-character include ROOT and static library; the
+          # curses.h header includes ncursesw/ncurses_dll.h internally.  The
           # installed DMG does not depend on /opt/homebrew or a Homebrew Cellar.
           pinentry_hook = '\tbuild_log "Configure $lib"\n'
           pinentry_config = '''\tif [[ "$libname" == pinentry ]]; then
           \t\t: "${GPGOSX_NCURSES_PREFIX:?Missing Homebrew ncurses prefix}"
-          \t\tncurses_include="$GPGOSX_NCURSES_PREFIX/include/ncursesw"
+          \t\t# ncursesw/curses.h includes <ncursesw/ncurses_dll.h>, so pass
+          \t\t# the PARENT include directory, not include/ncursesw alone.
+          \t\tncurses_include="$GPGOSX_NCURSES_PREFIX/include"
           \t\tncurses_archive="$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a"
-          \t\t[[ -f "$ncurses_include/curses.h" && -f "$ncurses_archive" ]] ||
+          \t\t[[ -f "$ncurses_include/curses.h" &&
+          \t\t   -f "$ncurses_include/ncursesw/curses.h" &&
+          \t\t   -f "$ncurses_include/ncursesw/ncurses_dll.h" &&
+          \t\t   -f "$ncurses_archive" ]] ||
           \t\t\tdie 'Missing matching wide-character ncurses headers/static archive'
+          \t\t# Prepend to the existing CPPFLAGS so the C compiler and
+          \t\t# configure's tests cannot silently fall back to Apple curses.
+          \t\tfor i in "${!cfenv[@]}"; do
+          \t\t\tif [[ "${cfenv[$i]}" == CPPFLAGS=* ]]; then
+          \t\t\t\tcfenv[$i]="CPPFLAGS=-I$ncurses_include ${cfenv[$i]#CPPFLAGS=}"
+          \t\t\tfi
+          \t\tdone
           \t\tcfenv+=(NCURSES_CFLAGS="-I$ncurses_include" NCURSES_LIBS="$ncurses_archive")
           \t\tcfopts+=(--with-ncurses-include-dir="$ncurses_include"
           \t\t         --enable-pinentry-curses --enable-pinentry-tty)
@@ -158,11 +176,11 @@ jobs:
               raise SystemExit('Unexpected upstream libgcrypt configure command; refusing patch')
           # Refuse to build against mismatched curses headers and libraries.
           # Pinentry's configure check must actually enable the wide API and
-          # its generated Makefile must use the static archive requested above.
+          # its generated Makefile must use the include root and static archive.
           check_pinentry = '''\tif [[ "$libname" == pinentry ]]; then
           \t\tgrep -Eq '^#define HAVE_NCURSESW 1$' config.h ||
           \t\t\tdie 'Pinentry did not detect wide-character ncurses'
-          \t\tgrep -Fq "$GPGOSX_NCURSES_PREFIX/include/ncursesw" pinentry/Makefile ||
+          \t\tgrep -Fq -- "-I$GPGOSX_NCURSES_PREFIX/include" pinentry/Makefile ||
           \t\t\tdie 'Pinentry Makefile does not use Homebrew ncursesw headers'
           \t\tgrep -Fq "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" pinentry/Makefile ||
           \t\t\tdie 'Pinentry Makefile does not link static ncursesw'
@@ -330,7 +348,7 @@ jobs:
           C
           "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
             "-mmacosx-version-min=$min_ver" -Werror=implicit-function-declaration \
-            -I"$GPGOSX_NCURSES_PREFIX/include/ncursesw" \
+            -I"$GPGOSX_NCURSES_PREFIX/include" \
             "$RUNNER_TEMP/ncursesw-smoke.c" \
             "$GPGOSX_NCURSES_PREFIX/lib/libncursesw.a" \
             -o "$RUNNER_TEMP/ncursesw-smoke"
