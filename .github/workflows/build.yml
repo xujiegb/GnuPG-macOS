@@ -78,7 +78,7 @@ jobs:
           test -f "$SOURCE_DIR/scripts/convert-keyring"
           mkdir -p "$GPGOSX_WORKDIR" "$GPGOSX_DOWNLOADDIR" "$SOURCE_DIR/logs"
 
-      - name: Adapt legacy build script for SQLite Autosetup
+      - name: Adapt legacy build for SQLite and verify libgcrypt TLS
         shell: bash
         run: |
           set -euo pipefail
@@ -105,10 +105,47 @@ jobs:
           """
           if original.count(before) != 1:
               raise SystemExit('Unexpected upstream build.sh layout; refusing unsafe patch')
-          path.write_text(original.replace(before, after, 1))
-          print('Patched SQLite configure: native build with explicit Apple Clang')
+          original = original.replace(before, after, 1)
+
+          # Abort immediately if libgcrypt's configure falsely detects no TLS.
+          # Otherwise the subsequent src/fips.c compilation fails with a
+          # misleading 'requires thread-local storage' error.
+          configure_line = ('\tenv "${cfenv[@]}" ./configure "${cfopts[@]}"'
+                            ' || die "Failed to configure $lib (cstep $cstep)"\n')
+          check_tls = '''\tif [[ "$libname" == libgcrypt ]]; then
+          \t\tif ! grep -Eq '^#define HAVE_GCC_STORAGE_CLASS__THREAD 1$' config.h; then
+          \t\t\techo 'libgcrypt configure did not detect __thread support' >&2
+          \t\t\tgrep -n 'gcry_cv_gcc_storage_class__thread' config.log | tail -5 || true
+          \t\t\tdie 'libgcrypt TLS configure probe failed; inspect config.log'
+          \t\tfi
+          \tfi
+          '''
+          if original.count(configure_line) != 1:
+              raise SystemExit('Unexpected upstream libgcrypt configure command; refusing patch')
+          path.write_text(original.replace(configure_line, configure_line + check_tls, 1))
+          print('Patched SQLite configure and libgcrypt TLS configuration check')
+          PYTHON
+          # Apple Clang 16.4 emits -Wdeprecated-ofast. libgcrypt configure.ac
+          # enables -Werror for feature probes (including __thread), so the
+          # warning would otherwise produce a false negative for TLS support.
+          # -O3 also avoids -ffast-math for a cryptographic library.
+          python3 - "$SOURCE_DIR/config-rel.sh" <<'PYTHON'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          data = path.read_text()
+          for arch in ('ARM', 'X86'):
+              old = f'{arch}_FLAGS+=" -Ofast"'
+              new = f'{arch}_FLAGS+=" -O3"'
+              if data.count(old) != 1:
+                  raise SystemExit(f'Unexpected optimization flags for {arch}')
+              data = data.replace(old, new, 1)
+          path.write_text(data)
+          print('Switched release optimization to -O3 for ARM64 and x86_64')
           PYTHON
           bash -n "$SOURCE_DIR/build.sh"
+          bash -n "$SOURCE_DIR/config-rel.sh"
 
       - name: Update dependencies and disable upstream's unconfigured signing
         shell: bash
@@ -223,6 +260,20 @@ jobs:
           "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
             "$RUNNER_TEMP/clang-smoke.c" -o "$RUNNER_TEMP/clang-smoke"
           file "$RUNNER_TEMP/clang-smoke"
+          # Match libgcrypt's -Werror __thread feature probe with the chosen
+          # target flags. Detect regressions before spending time on libraries.
+          printf 'static __thread int state; int main(void) { state=7; return state!=7; }\n' \
+            > "$RUNNER_TEMP/tls-smoke.c"
+          if [[ "$ARCH" == arm64 ]]; then
+            min_ver=11.0
+          else
+            min_ver=10.12
+          fi
+          "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
+            "-mmacosx-version-min=$min_ver" -O3 -Werror \
+            "$RUNNER_TEMP/tls-smoke.c" -o "$RUNNER_TEMP/tls-smoke"
+          "$RUNNER_TEMP/tls-smoke"
+          echo "Verified $ARCH compiler __thread TLS under -O3 -Werror"
           install_dir="/usr/local/gnupg-${GNUPG_VERSION%.*}"
           sudo mkdir -p "$install_dir"
           sudo chown "$(id -un)" "$install_dir"
@@ -234,6 +285,18 @@ jobs:
           test -x "$output/bin/gpg"
           file "$output/bin/gpg"
           "$output/bin/gpg" --version
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnuPG-${{ inputs.gnupg_version }}-${{ matrix.arch }}-build-logs
+          path: |
+            ${{ runner.temp }}/gpgosx-source/logs/
+            ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/libgcrypt-1.12.4/config.log
+            ${{ runner.temp }}/gnupg-work/${{ matrix.arch }}-build/libgcrypt-1.12.4/config.h
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Archive architecture-specific build
         shell: bash
