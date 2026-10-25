@@ -78,6 +78,38 @@ jobs:
           test -f "$SOURCE_DIR/scripts/convert-keyring"
           mkdir -p "$GPGOSX_WORKDIR" "$GPGOSX_DOWNLOADDIR" "$SOURCE_DIR/logs"
 
+      - name: Adapt legacy build script for SQLite Autosetup
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The legacy gpgosx script always adds --host, even for native
+          # compilation. SQLite 3.54.x uses Autosetup and searches for
+          # aarch64-apple-darwin-cc or x86_64-apple-darwin-cc as a result.
+          # Keep --host for other libraries; remove it only for SQLite.
+          python3 - "$SOURCE_DIR/build.sh" <<'PYTHON'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          original = path.read_text()
+          before = '\tcfopts=(--host="$HOSTTYPE" --prefix="$GPGOSX_DISTDIR" --disable-doc)\n'
+          after = """\tif [[ "$libname" == sqlite-autoconf ]]; then
+          \t\t# Both macOS runners build natively for their target architecture.
+          \t\t[[ "$(uname -m)" == "$ARCH" ]] || die "SQLite requires a native $ARCH runner"
+          \t\tcfopts=(--prefix="$GPGOSX_DISTDIR")
+          \t\t# Supply Apple's LLVM/Clang explicitly to SQLite Autosetup.
+          \t\tcfenv+=(CC="$CC" CXX="$CXX" CC_FOR_BUILD="$CC_FOR_BUILD")
+          \telse
+          \t\tcfopts=(--host="$HOSTTYPE" --prefix="$GPGOSX_DISTDIR" --disable-doc)
+          \tfi
+          """
+          if original.count(before) != 1:
+              raise SystemExit('Unexpected upstream build.sh layout; refusing unsafe patch')
+          path.write_text(original.replace(before, after, 1))
+          print('Patched SQLite configure: native build with explicit Apple Clang')
+          PYTHON
+          bash -n "$SOURCE_DIR/build.sh"
+
       - name: Update dependencies and disable upstream's unconfigured signing
         shell: bash
         run: |
@@ -163,6 +195,34 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The upstream script passes --host=aarch64-apple-darwin (or x86_64)
+          # to each library's configure script. SQLite 3.54 uses Autosetup,
+          # which otherwise searches for a non-existent host-prefixed cc/gcc.
+          # Select Apple's LLVM/Clang tools explicitly for both native runners.
+          actual_arch="$(uname -m)"
+          if [[ "$actual_arch" != "$ARCH" ]]; then
+            echo "Wrong runner architecture: expected $ARCH, got $actual_arch" >&2
+            exit 1
+          fi
+          export CC="$(xcrun --sdk macosx --find clang)"
+          export CXX="$(xcrun --sdk macosx --find clang++)"
+          export OBJC="$CC"
+          export CC_FOR_BUILD="$CC"
+          export AR="$(xcrun --sdk macosx --find ar)"
+          export RANLIB="$(xcrun --sdk macosx --find ranlib)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          for tool in "$CC" "$CXX" "$AR" "$RANLIB"; do
+            test -x "$tool" || { echo "Unavailable tool: $tool" >&2; exit 1; }
+          done
+          echo "Target architecture: $ARCH"
+          echo "Apple Clang: $CC"
+          "$CC" --version
+          echo "macOS SDK: $SDKROOT"
+          # Catch toolchain selection and target issues before building libs.
+          printf 'int main(void) { return 0; }\n' > "$RUNNER_TEMP/clang-smoke.c"
+          "$CC" -arch "$ARCH" -isysroot "$SDKROOT" \
+            "$RUNNER_TEMP/clang-smoke.c" -o "$RUNNER_TEMP/clang-smoke"
+          file "$RUNNER_TEMP/clang-smoke"
           install_dir="/usr/local/gnupg-${GNUPG_VERSION%.*}"
           sudo mkdir -p "$install_dir"
           sudo chown "$(id -un)" "$install_dir"
