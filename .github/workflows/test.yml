@@ -1,0 +1,295 @@
+name: Test GnuPG macOS DMGs
+
+on:
+  workflow_run:
+    workflows:
+      - Build GnuPG macOS DMGs
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Successful Build GnuPG macOS DMGs run ID to retest'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test-dmg:
+    name: Test ${{ matrix.flavor }} on ${{ matrix.arch }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: arm64
+            artifact_suffix: ARM64-DMG
+            arch: arm64
+            runner: macos-15
+          - flavor: x86_64
+            artifact_suffix: x86_64-DMG
+            arch: x86_64
+            runner: macos-15-intel
+          - flavor: universal
+            artifact_suffix: Universal-DMG
+            arch: arm64
+            runner: macos-15
+          - flavor: universal
+            artifact_suffix: Universal-DMG
+            arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      PACKAGE_FLAVOR: ${{ matrix.flavor }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+
+    steps:
+      - name: Locate and validate successful build run
+        id: build
+        shell: bash
+        env:
+          MANUAL_RUN_ID: ${{ inputs.build_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_run' ]]; then
+            source_run_id="$(jq -r '.workflow_run.id' "$GITHUB_EVENT_PATH")"
+          else
+            source_run_id="$MANUAL_RUN_ID"
+          fi
+          [[ "$source_run_id" =~ ^[0-9]+$ ]] || {
+            echo 'A numeric build run ID is required.' >&2
+            exit 1
+          }
+
+          # Only install packages from successful builds of this repository.
+          run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$source_run_id")"
+          name="$(jq -r '.name' <<< "$run_json")"
+          conclusion="$(jq -r '.conclusion' <<< "$run_json")"
+          origin="$(jq -r '.head_repository.full_name' <<< "$run_json")"
+          [[ "$name" == 'Build GnuPG macOS DMGs' \
+             && "$conclusion" == 'success' \
+             && "$origin" == "$GITHUB_REPOSITORY" ]] || {
+            printf 'Unexpected build run: name=%s conclusion=%s origin=%s\n' \
+              "$name" "$conclusion" "$origin" >&2
+            exit 1
+          }
+          echo "run_id=$source_run_id" >> "$GITHUB_OUTPUT"
+          echo "Testing artifact produced by $GITHUB_REPOSITORY Actions run $source_run_id"
+          [[ "$(uname -m)" == "$EXPECTED_ARCH" ]] || {
+            echo "Wrong runner CPU: $(uname -m), expected $EXPECTED_ARCH" >&2
+            exit 1
+          }
+
+      - name: Download DMG from the completed build
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ github.token }}
+          pattern: GnuPG-*-${{ matrix.artifact_suffix }}
+          path: ${{ runner.temp }}/gnupg-test-artifacts
+          merge-multiple: true
+
+      - name: Check DMG SHA-256 and mount read-only
+        shell: bash
+        run: |
+          set -euo pipefail
+          images=()
+          while IFS= read -r -d '' f; do images+=("$f"); done < <(
+            find "$RUNNER_TEMP/gnupg-test-artifacts" -type f \
+              -name "GnuPG-*-${PACKAGE_FLAVOR}.dmg" -print0
+          )
+          (( ${#images[@]} == 1 )) || {
+            echo "Expected exactly one $PACKAGE_FLAVOR DMG, found ${#images[@]}" >&2
+            exit 1
+          }
+          dmg="${images[0]}"
+          base="$(basename "$dmg")"
+          [[ "$base" =~ ^GnuPG-(2\.(4|5)\.[0-9]+)-(arm64|x86_64|universal)\.dmg$ ]] || {
+            echo "Unexpected DMG filename: $base" >&2
+            exit 1
+          }
+          version="${BASH_REMATCH[1]}"
+          [[ "${BASH_REMATCH[3]}" == "$PACKAGE_FLAVOR" ]] || exit 1
+          checksum="${dmg}.sha256"
+          test -s "$checksum" || { echo 'Missing SHA-256 file' >&2; exit 1; }
+          (cd "$(dirname "$dmg")" && shasum -a 256 -c "$(basename "$checksum")")
+          hdiutil verify "$dmg"
+
+          mkdir -p "$RUNNER_TEMP/gnupg-test-reports" "$RUNNER_TEMP/gnupg-mounted"
+          hdiutil attach -readonly -nobrowse -mountpoint "$RUNNER_TEMP/gnupg-mounted" "$dmg"
+          test -s "$RUNNER_TEMP/gnupg-mounted/Install.pkg" || {
+            echo 'Install.pkg not present in DMG' >&2; exit 1;
+          }
+          pkgutil --check-signature "$RUNNER_TEMP/gnupg-mounted/Install.pkg" \
+            > "$RUNNER_TEMP/gnupg-test-reports/package-signature.txt" 2>&1 || true
+          printf 'GNUPG_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'GNUPG_PREFIX=/usr/local/gnupg-%s\n' "${version%.*}" >> "$GITHUB_ENV"
+          printf 'DMG_FILENAME=%s\n' "$base" >> "$GITHUB_ENV"
+          printf 'DMG_PATH=%s\n' "$dmg" >> "$GITHUB_ENV"
+
+      - name: Install package into clean macOS runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e "$GNUPG_PREFIX/bin/gpg" || {
+            echo "Runner is not clean: $GNUPG_PREFIX/bin/gpg already exists" >&2
+            exit 1
+          }
+          sudo installer -pkg "$RUNNER_TEMP/gnupg-mounted/Install.pkg" -target / \
+            2>&1 | tee "$RUNNER_TEMP/gnupg-test-reports/installer.log"
+          test -x "$GNUPG_PREFIX/bin/gpg"
+          echo "Installed to $GNUPG_PREFIX"
+
+      - name: Audit installed Mach-O slices and library paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/gnupg-test-reports/macho-audit.txt"
+          gpg="$GNUPG_PREFIX/bin/gpg"
+          test -x "$gpg"
+          echo "Native architecture: $EXPECTED_ARCH" | tee "$report"
+          checked=0
+          while IFS= read -r -d '' f; do
+            description="$(file -b "$f")"
+            [[ "$description" == *'Mach-O'* ]] || continue
+            slices=" $(lipo -archs "$f") "
+            if [[ "$PACKAGE_FLAVOR" == universal ]]; then
+              [[ "$slices" == *' arm64 '* && "$slices" == *' x86_64 '* ]] || {
+                echo "Non-universal Mach-O: $f ($slices)" | tee -a "$report"
+                exit 1
+              }
+            else
+              [[ "$slices" == " $EXPECTED_ARCH " ]] || {
+                echo "Wrong Mach-O architecture: $f ($slices)" | tee -a "$report"
+                exit 1
+              }
+            fi
+            if ! otool -L "$f" > "$RUNNER_TEMP/gnupg-test-reports/current-otool.txt" 2>&1; then
+              echo "Cannot inspect Mach-O library dependencies: $f" | tee -a "$report"
+              exit 1
+            fi
+            if grep -E '/opt/homebrew/|/usr/local/(Cellar|opt)/|/Users/runner/|/gnupg-work/|/gnupg-package/' \
+              "$RUNNER_TEMP/gnupg-test-reports/current-otool.txt"; then
+              echo "Non-portable dylib path: $f" | tee -a "$report"
+              exit 1
+            fi
+            echo "PASS $slices ${f#"$GNUPG_PREFIX"/}" >> "$report"
+            checked=$((checked + 1))
+          done < <(find "$GNUPG_PREFIX" -type f -print0)
+          (( checked > 0 )) || { echo 'No Mach-O files found' >&2; exit 1; }
+          echo "Audited $checked Mach-O files" | tee -a "$report"
+          lipo -info "$gpg"
+          # Universal binaries are ad-hoc signed by the build workflow.
+          if [[ "$PACKAGE_FLAVOR" == universal ]]; then
+            codesign --verify --verbose=2 "$gpg"
+          fi
+
+      - name: Exercise installed GnuPG and services
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_INSERT_LIBRARIES
+          dir="$RUNNER_TEMP/gnupg-test-reports"
+          gpg="$GNUPG_PREFIX/bin/gpg"
+          gpgconf="$GNUPG_PREFIX/bin/gpgconf"
+          for executable in gpg gpgconf gpg-agent gpg-connect-agent gpgsm dirmngr pinentry-curses; do
+            test -x "$GNUPG_PREFIX/bin/$executable" || {
+              echo "Missing installed executable: $executable" >&2; exit 1;
+            }
+            "$GNUPG_PREFIX/bin/$executable" --version | sed -n '1p'
+          done
+          version_line="$("$gpg" --version | sed -n '1p')"
+          [[ "$version_line" == "gpg (GnuPG) $GNUPG_VERSION" ]] || {
+            echo "Incorrect GnuPG version: $version_line" >&2; exit 1;
+          }
+          "$gpg" --version > "$dir/gpg-version.txt"
+          "$gpgconf" --list-dirs > "$dir/gpgconf-dirs.txt"
+          if grep -E '/Users/runner/|/gnupg-work/|/gnupg-package/' "$dir/gpgconf-dirs.txt"; then
+            echo 'Build temporary path leaked into GnuPG runtime configuration' >&2
+            exit 1
+          fi
+          "$gpgconf" --check-programs 2>&1 | tee "$dir/gpgconf-check-programs.txt"
+
+          export GNUPGHOME="$RUNNER_TEMP/gnupg-ci-home"
+          mkdir -m 700 "$GNUPGHOME"
+          "$gpgconf" --launch gpg-agent
+          "$GNUPG_PREFIX/bin/gpg-connect-agent" 'GETINFO version' /bye \
+            2>&1 | tee "$dir/gpg-agent.txt"
+          "$GNUPG_PREFIX/bin/dirmngr" --version | sed -n '1p'
+
+          printf 'GnuPG macOS CI smoke test\n' > "$dir/message.txt"
+          pass='temporary-ci-test-only'
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase "$pass" \
+            --cipher-algo AES256 --symmetric \
+            --output "$dir/message.gpg" "$dir/message.txt"
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase "$pass" \
+            --decrypt --output "$dir/roundtrip.txt" "$dir/message.gpg"
+          cmp "$dir/message.txt" "$dir/roundtrip.txt"
+          echo 'PASS AES-256 symmetric encryption roundtrip'
+
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key 'GnuPG CI Test <ci@example.invalid>' ed25519 sign 0
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase '' \
+            --detach-sign --output "$dir/message.sig" "$dir/message.txt"
+          "$gpg" --batch --verify "$dir/message.sig" "$dir/message.txt" \
+            2>&1 | tee "$dir/signature-verification.txt"
+          echo 'PASS Ed25519 key generation and signature verification'
+
+          fingerprint="$("$gpg" --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [[ "$fingerprint" =~ ^[A-F0-9]{40,64}$ ]] || {
+            echo 'Could not determine test key fingerprint' >&2; exit 1;
+          }
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase '' \
+            --quick-add-key "$fingerprint" cv25519 encr 0
+          "$gpg" --batch --yes --trust-model always --recipient "$fingerprint" \
+            --encrypt --output "$dir/public-key.gpg" "$dir/message.txt"
+          "$gpg" --batch --yes --pinentry-mode loopback --passphrase '' \
+            --decrypt --output "$dir/public-key-roundtrip.txt" "$dir/public-key.gpg"
+          cmp "$dir/message.txt" "$dir/public-key-roundtrip.txt"
+          echo 'PASS Curve25519 public-key encryption/decryption'
+          "$gpgconf" --kill gpg-agent
+
+      - name: Report success
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### GnuPG DMG end-to-end tests passed'
+            echo
+            echo "- Package: \`$DMG_FILENAME\`"
+            echo "- Runner: \`$(uname -m)\`"
+            echo "- Version: \`$GNUPG_VERSION\`"
+            echo '- SHA-256 verified; DMG verified and installed with macOS installer'
+            echo '- Installed Mach-O architectures and dynamic library references audited'
+            echo '- gpgconf, gpg-agent, and pinentry-curses startup/version checks passed'
+            echo '- AES-256 and Curve25519 encryption/decryption; Ed25519 sign/verify passed'
+            echo '- Note: interactive curses Pinentry and Apple Developer ID notarization are not tested'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unmount DMG (even if tests fail)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mountpoint="$RUNNER_TEMP/gnupg-mounted"
+          if mount | grep -F " on $mountpoint (" >/dev/null; then
+            hdiutil detach "$mountpoint" || hdiutil detach -force "$mountpoint"
+          fi
+          if [[ -d "$RUNNER_TEMP/gnupg-ci-home" && -n "${GNUPG_PREFIX:-}" ]]; then
+            GNUPGHOME="$RUNNER_TEMP/gnupg-ci-home" \
+              "$GNUPG_PREFIX/bin/gpgconf" --kill gpg-agent || true
+          fi
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GnuPG-tests-${{ matrix.flavor }}-on-${{ matrix.arch }}
+          path: ${{ runner.temp }}/gnupg-test-reports/
+          if-no-files-found: ignore
+          retention-days: 14
