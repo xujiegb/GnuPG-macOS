@@ -424,6 +424,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # Disable Spotlight indexing to avoid "Resource busy" during hdiutil unmount
+          sudo mdutil -a -i off 2>/dev/null || true
+
+          create_dmg_safe() {
+            local volname="$1"
+            local srcfolder="$2"
+            local output="$3"
+            local retries=5
+            local count=1
+
+            sync
+            while true; do
+              if hdiutil create -ov -format UDZO -fs HFS+ \
+                -volname "$volname" \
+                -srcfolder "$srcfolder" \
+                "$output"; then
+                break
+              fi
+              if (( count >= retries )); then
+                echo "hdiutil create failed after ${retries} attempts: $output" >&2
+                return 1
+              fi
+              echo "hdiutil encountered Resource busy, retrying in 3s ($count/$retries)..." >&2
+              sleep 3
+              sync
+              count=$((count + 1))
+            done
+          }
+
           work="$RUNNER_TEMP/gnupg-package"
           mkdir -p "$work" "$work/rel" "$work/dmg-content" "$work/output" "$work/pkg-scripts"
           tar -C "$work" -xzf "$RUNNER_TEMP/archives/gnupg-arm64.tar.gz"
@@ -504,7 +534,24 @@ jobs:
             --version "$GNUPG_VERSION" \
             --scripts "$work/pkg-scripts" \
             "$work/GnuPG.pkg"
-          productbuild --package "$work/GnuPG.pkg" "$work/dmg-content/Install.pkg"
+
+          productbuild --synthesize --package "$work/GnuPG.pkg" "$work/Distribution.xml"
+          python3 - "$work/Distribution.xml" <<'PYTHON'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          tree = ET.parse(sys.argv[1])
+          root = tree.getroot()
+          title = ET.Element('title')
+          title.text = 'GnuPG'
+          root.insert(0, title)
+          tree.write(sys.argv[1], encoding='utf-8', xml_declaration=True)
+          PYTHON
+
+          productbuild \
+            --distribution "$work/Distribution.xml" \
+            --package-path "$work" \
+            "$work/dmg-content/Install.pkg"
 
           cat > "$work/dmg-content/README.txt" <<EOF
           GnuPG $GNUPG_VERSION for macOS (Universal 2: arm64 + x86_64)
@@ -518,11 +565,7 @@ jobs:
           EOF
 
           image="GnuPG-${GNUPG_VERSION}-universal.dmg"
-          hdiutil create \
-            -ov -format UDZO -fs HFS+ \
-            -volname "GnuPG $GNUPG_VERSION" \
-            -srcfolder "$work/dmg-content" \
-            "$work/output/$image"
+          create_dmg_safe "GnuPG $GNUPG_VERSION" "$work/dmg-content" "$work/output/$image"
           hdiutil verify "$work/output/$image"
           (cd "$work/output" && shasum -a 256 "$image" > "$image.sha256")
           ls -lh "$work/output"
@@ -536,6 +579,32 @@ jobs:
           test -x "$work/arm64-rel/bin/gpg"
           test -x "$work/x86_64-rel/bin/gpg"
           test -x "$work/pkg-scripts/postinstall"
+
+          create_dmg_safe() {
+            local volname="$1"
+            local srcfolder="$2"
+            local output="$3"
+            local retries=5
+            local count=1
+
+            sync
+            while true; do
+              if hdiutil create -ov -format UDZO -fs HFS+ \
+                -volname "$volname" \
+                -srcfolder "$srcfolder" \
+                "$output"; then
+                break
+              fi
+              if (( count >= retries )); then
+                echo "hdiutil create failed after ${retries} attempts: $output" >&2
+                return 1
+              fi
+              echo "hdiutil encountered Resource busy, retrying in 3s ($count/$retries)..." >&2
+              sleep 3
+              sync
+              count=$((count + 1))
+            done
+          }
 
           for arch in arm64 x86_64; do
             stage="$work/${arch}-rel"
@@ -579,7 +648,24 @@ jobs:
               --version "$GNUPG_VERSION" \
               --scripts "$work/pkg-scripts" \
               "$work/GnuPG-${arch}.pkg"
-            productbuild --package "$work/GnuPG-${arch}.pkg" "$dmg_folder/Install.pkg"
+
+            productbuild --synthesize --package "$work/GnuPG-${arch}.pkg" "$work/Distribution-${arch}.xml"
+            python3 - "$work/Distribution-${arch}.xml" <<'PYTHON'
+            import sys
+            import xml.etree.ElementTree as ET
+
+            tree = ET.parse(sys.argv[1])
+            root = tree.getroot()
+            title = ET.Element('title')
+            title.text = 'GnuPG'
+            root.insert(0, title)
+            tree.write(sys.argv[1], encoding='utf-8', xml_declaration=True)
+            PYTHON
+
+            productbuild \
+              --distribution "$work/Distribution-${arch}.xml" \
+              --package-path "$work" \
+              "$dmg_folder/Install.pkg"
 
             cat > "$dmg_folder/README.txt" <<EOF
           GnuPG $GNUPG_VERSION for macOS ($arch)
@@ -594,11 +680,7 @@ jobs:
           EOF
 
             image="GnuPG-${GNUPG_VERSION}-${arch}.dmg"
-            hdiutil create \
-              -ov -format UDZO -fs HFS+ \
-              -volname "GnuPG $GNUPG_VERSION $arch" \
-              -srcfolder "$dmg_folder" \
-              "$work/output/$image"
+            create_dmg_safe "GnuPG $GNUPG_VERSION $arch" "$dmg_folder" "$work/output/$image"
             hdiutil verify "$work/output/$image"
             (cd "$work/output" && shasum -a 256 "$image" > "$image.sha256")
           done
