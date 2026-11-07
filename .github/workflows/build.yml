@@ -639,6 +639,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/gnupg-package/output"
@@ -676,6 +677,7 @@ jobs:
           else
             echo "Creating release $tag..."
             gh release create "$tag" "${files[@]}" \
+              --target "$GITHUB_SHA" \
               --title "GnuPG ${GNUPG_VERSION} (macOS)" \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
