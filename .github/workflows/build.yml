@@ -10,7 +10,7 @@ on:
         default: '2.5.24'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: gnupg-dmg-${{ github.run_id }}
@@ -634,3 +634,48 @@ jobs:
             ${{ runner.temp }}/gnupg-package/output/GnuPG-${{ inputs.gnupg_version }}-universal.dmg.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/gnupg-package/output"
+          tag="v${GNUPG_VERSION}"
+
+          files=(
+            "$work/GnuPG-${GNUPG_VERSION}-universal.dmg"
+            "$work/GnuPG-${GNUPG_VERSION}-universal.dmg.sha256"
+            "$work/GnuPG-${GNUPG_VERSION}-arm64.dmg"
+            "$work/GnuPG-${GNUPG_VERSION}-arm64.dmg.sha256"
+            "$work/GnuPG-${GNUPG_VERSION}-x86_64.dmg"
+            "$work/GnuPG-${GNUPG_VERSION}-x86_64.dmg.sha256"
+          )
+
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          ## GnuPG ${GNUPG_VERSION} for macOS
+
+          Automated build of official GnuPG release **${GNUPG_VERSION}**.
+
+          ### Available Packages
+          - **Universal 2**: \`GnuPG-${GNUPG_VERSION}-universal.dmg\` (Apple Silicon + Intel 64-bit)
+          - **Apple Silicon (arm64)**: \`GnuPG-${GNUPG_VERSION}-arm64.dmg\`
+          - **Intel (x86_64)**: \`GnuPG-${GNUPG_VERSION}-x86_64.dmg\`
+
+          ### Installation Note (Gatekeeper Bypass)
+          These packages are ad-hoc signed and not notarized by Apple. If macOS 15 blocks \`Install.pkg\`, remove the quarantine attribute before running:
+          \`\`\`bash
+          xattr -dr com.apple.quarantine GnuPG-${GNUPG_VERSION}-*.dmg
+          \`\`\`
+          EOF
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Uploading assets..."
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            echo "Creating release $tag..."
+            gh release create "$tag" "${files[@]}" \
+              --title "GnuPG ${GNUPG_VERSION} (macOS)" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
