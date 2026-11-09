@@ -651,16 +651,16 @@ jobs:
 
             productbuild --synthesize --package "$work/GnuPG-${arch}.pkg" "$work/Distribution-${arch}.xml"
             python3 - "$work/Distribution-${arch}.xml" <<'PYTHON'
-            import sys
-            import xml.etree.ElementTree as ET
+          import sys
+          import xml.etree.ElementTree as ET
 
-            tree = ET.parse(sys.argv[1])
-            root = tree.getroot()
-            title = ET.Element('title')
-            title.text = 'GnuPG'
-            root.insert(0, title)
-            tree.write(sys.argv[1], encoding='utf-8', xml_declaration=True)
-            PYTHON
+          tree = ET.parse(sys.argv[1])
+          root = tree.getroot()
+          title = ET.Element('title')
+          title.text = 'GnuPG'
+          root.insert(0, title)
+          tree.write(sys.argv[1], encoding='utf-8', xml_declaration=True)
+          PYTHON
 
             productbuild \
               --distribution "$work/Distribution-${arch}.xml" \
